@@ -1,0 +1,105 @@
+####### merging the selected matched file with all variables to the linkedin data ##############
+
+library(readr)
+library(dplyr)
+
+folder <- "C:/Users/zsofi/OneDrive - TUM/Desktop/TUM/01_Master Thesis/ICPEI data/z_Eigenvector_centrality_files"
+
+main_path <- file.path(folder, "SELECTED_Matched_Treated_Control_firms_all_variables_option3_spec3_with_linkedin_ids.csv")
+cent_path <- file.path(folder, "organizations_with_centralities.csv")
+out_path  <- file.path(folder, "SELECTED_Matched_Treated_Control_firms_all_variables_option3_spec3_with_linkedin_ids_with_centralities.csv")
+
+# Read (semicolon-delimited)
+main_df <- read_delim(main_path, delim = ";", show_col_types = FALSE)
+cent_df <- read_delim(cent_path, delim = ",", show_col_types = FALSE)
+
+# De-duplicate centralities by Linkedin_name, keep first occurrence
+cent_uniq <- cent_df %>% distinct(Linkedin_name, .keep_all = TRUE)
+
+# Left-join: Linkedin_name (main) = Linkedin_name (centralities)
+result_df <- left_join(main_df, cent_uniq, by = c("Linkedin_name" = "Linkedin_name"))
+
+# Save
+write.csv(result_df, out_path, na = "NA")
+
+
+
+################## plotting the centrality trends   #################################
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(stringr)
+
+# ---- reshape ALL centralities once ----
+# Picks columns like Hydrogen_degree_centrality_2020, Battery_closeness_centrality_2024, etc.
+long_all <- df %>%
+  select(
+    Group,
+    matches("^(Hydrogen|Battery)_(degree|closeness|betweenness|eigenvector)_centrality_20\\d{2}$", ignore.case = TRUE)
+  ) %>%
+  pivot_longer(
+    cols = -Group,
+    names_to   = c("Domain", "Metric", "Year"),
+    names_pattern = "^(Hydrogen|Battery)_(degree|closeness|betweenness|eigenvector)_centrality_(20\\d{2})$",
+    values_to  = "value"
+  ) %>%
+  mutate(
+    Year   = as.integer(Year),
+    Metric = tolower(Metric),
+    value  = as.numeric(value)
+  )
+
+# ---- plotting helper you can call per metric ----
+plot_centrality <- function(which_metric = c("degree","closeness","betweenness","eigenvector"),
+                            save = FALSE, out_folder = folder) {
+  which_metric <- match.arg(which_metric)
+
+  agg <- long_all %>%
+    filter(Metric == which_metric) %>%
+    group_by(Domain, Year, Group) %>%
+    summarise(mean_val = mean(value, na.rm = TRUE), .groups = "drop")
+
+  p <- ggplot(agg, aes(x = Year, y = mean_val, color = Group, group = Group)) +
+    geom_line(linewidth = 1) +
+    geom_point(size = 2) +
+    facet_wrap(~ Domain, scales = "free_y") +
+    labs(
+      title = paste0(str_to_title(which_metric), " Centrality (Mean) — Treated vs Control"),
+      x = "Year",
+      y = paste0("Mean ", which_metric, " centrality"),
+      color = "Group"
+    ) +
+    theme_minimal()
+
+  print(p)
+
+  if (isTRUE(save)) {
+    ggsave(file.path(out_folder, paste0(which_metric, "_centrality_trends_by_group.png")),
+           p, width = 9, height = 5, dpi = 300)
+  }
+
+  invisible(p)
+}
+
+# ---- call the visuals ----
+plot_centrality("degree")       # Degree centrality trends
+plot_centrality("closeness")    # Closeness centrality trends
+plot_centrality("betweenness")  # Betweenness centrality trends
+plot_centrality("eigenvector")  # Eigenvector centrality trends
+
+library(patchwork)
+
+p_all <- (plot_centrality("degree") | plot_centrality("closeness")) /
+         (plot_centrality("betweenness") | plot_centrality("eigenvector"))
+
+print(p_all)
+
+# Save the combined plot
+ggsave(
+  filename = file.path(folder, "centrality_trends_all.png"),
+  plot = p_all,
+  width = 14,   # width in inches
+  height = 10,  # height in inches
+  dpi = 300     # resolution
+)
