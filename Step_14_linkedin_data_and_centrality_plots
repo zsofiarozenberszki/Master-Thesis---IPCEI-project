@@ -1,105 +1,318 @@
-####### merging the selected matched file with all variables to the linkedin data ##############
+# =========================
+# Merge with exact + fuzzy match, then de-duplicate
+# =========================
 
 library(readr)
 library(dplyr)
+library(stringr)
+library(fuzzyjoin)
+library(janitor)
+library(tidyr)
 
-folder <- "C:/Users/zsofi/OneDrive - TUM/Desktop/TUM/01_Master Thesis/ICPEI data/z_Eigenvector_centrality_files"
+# ---- Paths ----
+data_dir <- "C:/Users/zsofi/OneDrive - TUM/Desktop/TUM/01_Master Thesis/ICPEI data/z_Eigenvector_centrality_files"
+file_orgs     <- file.path(data_dir, "organizations_with_centralities.csv")
+file_selected <- file.path(data_dir, "SELECTED_Matched_Treated_Control_firms_all_variables_option3_spec3_with_linkedin_ids.csv")
 
-main_path <- file.path(folder, "SELECTED_Matched_Treated_Control_firms_all_variables_option3_spec3_with_linkedin_ids.csv")
-cent_path <- file.path(folder, "organizations_with_centralities.csv")
-out_path  <- file.path(folder, "SELECTED_Matched_Treated_Control_firms_all_variables_option3_spec3_with_linkedin_ids_with_centralities.csv")
+# ---- Load ----
+orgs <- readr::read_csv(file_orgs, show_col_types = FALSE, guess_max = 200000)
+selected <- readr::read_csv2(file_selected, locale = locale(encoding = "Latin1"), show_col_types = FALSE)
 
-# Read (semicolon-delimited)
-main_df <- read_delim(main_path, delim = ";", show_col_types = FALSE)
-cent_df <- read_delim(cent_path, delim = ",", show_col_types = FALSE)
+stopifnot("Linkedin_name" %in% names(orgs))
+stopifnot("Linkedin_name" %in% names(selected))
 
-# De-duplicate centralities by Linkedin_name, keep first occurrence
-cent_uniq <- cent_df %>% distinct(Linkedin_name, .keep_all = TRUE)
+# ---- Normalization helper ----
+norm_key <- function(x) {
+  x %>%
+    tolower() %>%
+    str_trim() %>%
+    str_remove("^https?://(www\\.)?linkedin\\.com/company/") %>%
+    str_remove("^@") %>%
+    str_replace_all("[^a-z0-9]", "")
+}
 
-# Left-join: Linkedin_name (main) = Linkedin_name (centralities)
-result_df <- left_join(main_df, cent_uniq, by = c("Linkedin_name" = "Linkedin_name"))
+orgs    <- orgs    %>% mutate(.norm = norm_key(Linkedin_name))
+selected<- selected %>% mutate(.norm = norm_key(Linkedin_name))
 
-# Save
-write.csv(result_df, out_path, na = "NA")
+# ---- 1) Exact join on normalized key ----
+exact_join <- selected %>%
+  left_join(orgs, by = ".norm", suffix = c("", "_orgs"))
+
+unmatched_idx <- which(is.na(exact_join$Linkedin_name_orgs))
+unmatched <- exact_join[unmatched_idx, , drop = FALSE]
+
+# ---- 2) Fuzzy join for the unmatched (blocking by first 6 chars) ----
+orgs_block <- orgs %>%
+  mutate(.block = str_sub(.norm, 1, 6)) %>%
+  select(.norm, .block, everything())
+
+unmatched_block <- unmatched %>%
+  mutate(.block = str_sub(.norm, 1, 6)) %>%
+  select(.norm, .block, everything())
+
+# Jaro-Winkler distance; threshold ~0.10 ≈ ~0.90 similarity
+fuzzy_pairs <- stringdist_inner_join(
+  unmatched_block, orgs_block,
+  by = c(".block" = ".block"),
+  max_dist = Inf, method = "jw", distance_col = ".dist"
+) %>%
+  # keep only comparisons of the normalized keys (same block already reduces pairs)
+  mutate(sim = 1 - stringdist::stringdist(.norm.x, .norm.y, method = "jw")) %>%
+  filter(sim >= 0.90) %>%                   # threshold (tune: 0.90 to 0.85)
+  select(.norm = .norm.x, sim,
+         starts_with(".block"), ends_with(".y"), everything())
+
+# For each unmatched .norm, keep the single best fuzzy candidate (highest similarity)
+fuzzy_best <- fuzzy_pairs %>%
+  group_by(.norm) %>%
+  slice_max(order_by = sim, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+# Align orgs-cols from fuzzy to match exact join suffixes
+orgs_cols <- setdiff(names(orgs), c(".norm", ".block"))
+fuzzy_fill <- fuzzy_best %>%
+  select(.norm,
+         all_of(orgs_cols) := across(all_of(orgs_cols), \(x) x)) %>%
+  rename_with(~ paste0(., "_orgs"), all_of(orgs_cols)) %>%
+  mutate(fuzzy_score = sim)
+
+# ---- 3) Combine exact + fuzzy ----
+final <- exact_join
+
+# Insert fuzzy results into previously unmatched rows (by .norm)
+final_unmatched_fill <- final %>%
+  filter(row_number() %in% unmatched_idx) %>%
+  select(.norm)
+
+final_unmatched_fill <- final_unmatched_fill %>%
+  left_join(fuzzy_fill, by = ".norm")
+
+# Write back into final (only overlapping columns)
+overlap_cols <- intersect(names(final), names(final_unmatched_fill))
+final[unmatched_idx, overlap_cols] <- final_unmatched_fill[, overlap_cols]
+
+# Mark match origin
+final <- final %>%
+  mutate(
+    matched_from = case_when(
+      !is.na(Linkedin_name_orgs) & is.na(fuzzy_score) ~ "exact",
+      !is.na(Linkedin_name_orgs) & !is.na(fuzzy_score) ~ "fuzzy",
+      TRUE ~ "none"
+    )
+  )
+
+# ---- 4) De-duplicate: keep exact over fuzzy over none; for fuzzy ties keep highest fuzzy_score ----
+final_nodup <- final %>%
+  mutate(
+    # Priority: exact (1), fuzzy (2), none (3)
+    match_priority = case_when(
+      matched_from == "exact" ~ 1L,
+      matched_from == "fuzzy" ~ 2L,
+      TRUE ~ 3L
+    ),
+    fuzzy_score = ifelse(is.na(fuzzy_score), -Inf, fuzzy_score)
+  ) %>%
+  arrange(Linkedin_name, match_priority, desc(fuzzy_score)) %>%
+  group_by(Linkedin_name) %>%
+  slice(1) %>%
+  ungroup() %>%
+  select(-match_priority)
+
+# ---- 5) Diagnostics ----
+stats <- tibble(
+  rows_in_SELECTED   = nrow(selected),
+  rows_in_ORGS       = nrow(orgs),
+  matched_exact      = sum(!is.na(exact_join$Linkedin_name_orgs)),
+  matched_fuzzy      = sum(final$matched_from == "fuzzy", na.rm = TRUE),
+  still_unmatched    = sum(is.na(final$Linkedin_name_orgs)),
+  rows_after_dedup   = nrow(final_nodup)
+)
+print(stats)
+
+# Quick example check
+example <- final_nodup %>%
+  filter(str_detect(tolower(Linkedin_name), "advent-technologies")) %>%
+  select(`Company name`, Linkedin_name, Linkedin_name_orgs, matched_from, fuzzy_score)
+print(example)
+
+# ---- 6) Save with semicolon separator, dot decimals, and NA for missing ----
+out_exact_fuzzy <- file.path(data_dir, "SELECTED_with_centralities_FUZZY.csv")
+out_nodup       <- file.path(data_dir, "SELECTED_with_centralities_FUZZY_nodup.csv")
+
+# Save exact+fuzzy merged (with all duplicates)
+readr::write_delim(final, out_exact_fuzzy, delim = ";", na = "NA")
+
+# Save deduplicated version
+readr::write_delim(final_nodup %>% remove_empty("cols"), out_nodup, delim = ";", na = "NA")
+
+message("Saved as semicolon-delimited CSVs with dot decimal mark and NA for missing values:\n - ", out_exact_fuzzy, "\n - ", out_nodup)
 
 
-
-################## plotting the centrality trends   #################################
-
+# ------- libraries -------
+# install.packages(c("readr","dplyr","tidyr","ggplot2","stringr","patchwork"))
+library(readr)
 library(dplyr)
 library(tidyr)
 library(ggplot2)
 library(stringr)
-
-# ---- reshape ALL centralities once ----
-# Picks columns like Hydrogen_degree_centrality_2020, Battery_closeness_centrality_2024, etc.
-long_all <- df %>%
-  select(
-    Group,
-    matches("^(Hydrogen|Battery)_(degree|closeness|betweenness|eigenvector)_centrality_20\\d{2}$", ignore.case = TRUE)
-  ) %>%
-  pivot_longer(
-    cols = -Group,
-    names_to   = c("Domain", "Metric", "Year"),
-    names_pattern = "^(Hydrogen|Battery)_(degree|closeness|betweenness|eigenvector)_centrality_(20\\d{2})$",
-    values_to  = "value"
-  ) %>%
-  mutate(
-    Year   = as.integer(Year),
-    Metric = tolower(Metric),
-    value  = as.numeric(value)
-  )
-
-# ---- plotting helper you can call per metric ----
-plot_centrality <- function(which_metric = c("degree","closeness","betweenness","eigenvector"),
-                            save = FALSE, out_folder = folder) {
-  which_metric <- match.arg(which_metric)
-
-  agg <- long_all %>%
-    filter(Metric == which_metric) %>%
-    group_by(Domain, Year, Group) %>%
-    summarise(mean_val = mean(value, na.rm = TRUE), .groups = "drop")
-
-  p <- ggplot(agg, aes(x = Year, y = mean_val, color = Group, group = Group)) +
-    geom_line(linewidth = 1) +
-    geom_point(size = 2) +
-    facet_wrap(~ Domain, scales = "free_y") +
-    labs(
-      title = paste0(str_to_title(which_metric), " Centrality (Mean) — Treated vs Control"),
-      x = "Year",
-      y = paste0("Mean ", which_metric, " centrality"),
-      color = "Group"
-    ) +
-    theme_minimal()
-
-  print(p)
-
-  if (isTRUE(save)) {
-    ggsave(file.path(out_folder, paste0(which_metric, "_centrality_trends_by_group.png")),
-           p, width = 9, height = 5, dpi = 300)
-  }
-
-  invisible(p)
-}
-
-# ---- call the visuals ----
-plot_centrality("degree")       # Degree centrality trends
-plot_centrality("closeness")    # Closeness centrality trends
-plot_centrality("betweenness")  # Betweenness centrality trends
-plot_centrality("eigenvector")  # Eigenvector centrality trends
-
 library(patchwork)
 
-p_all <- (plot_centrality("degree") | plot_centrality("closeness")) /
-         (plot_centrality("betweenness") | plot_centrality("eigenvector"))
+# ------- paths -------
+folder  <- "C:/Users/zsofi/OneDrive - TUM/Desktop/TUM/01_Master Thesis/ICPEI data/z_Eigenvector_centrality_files"
+# ensure you have the correct filename + extension here:
+in_path <- file.path(folder, "SELECTED_Matched_Merged_final.csv")
 
-print(p_all)
+# ------- load (semicolon-delimited) -------
+# If you saved with dot decimals (.), default readr is fine.
+# If you ever have comma decimals, use locale(decimal_mark = ",")
+df <- read_delim(in_path, delim = ";", show_col_types = FALSE, na = c("", "NA"))
 
-# Save the combined plot
-ggsave(
-  filename = file.path(folder, "centrality_trends_all.png"),
-  plot = p_all,
-  width = 14,   # width in inches
-  height = 10,  # height in inches
-  dpi = 300     # resolution
-)
+# Tidy column names (trim stray spaces)
+names(df) <- trimws(names(df))
+
+# ------- label groups (robust to "1"/1/"0"/0/NA) -------
+df <- df %>%
+  mutate(
+    Treatment_num = suppressWarnings(as.integer(as.character(Treatment))),
+    Group = case_when(
+      Treatment_num == 1 ~ "Treated",
+      Treatment_num == 0 ~ "Control",
+      TRUE               ~ NA_character_
+    )
+  )
+
+# ------- pick eigenvector columns only -------
+evc_cols <- grep("_eigenvector_centrality_20", names(df), value = TRUE, ignore.case = TRUE)
+
+if (length(evc_cols) > 0) {
+  # ------- reshape to long -------
+  long <- df %>%
+    select(Group, all_of(evc_cols)) %>%
+    pivot_longer(
+      cols = all_of(evc_cols),
+      names_to = "metric",
+      values_to = "eigenvector"
+    ) %>%
+    mutate(
+      Domain = case_when(
+        str_starts(metric, regex("Hydrogen", ignore_case = TRUE)) ~ "Hydrogen",
+        str_starts(metric, regex("Battery",  ignore_case = TRUE)) ~ "Battery",
+        TRUE ~ NA_character_
+      ),
+      Year = suppressWarnings(as.integer(str_extract(metric, "20\\d{2}"))),
+      eigenvector = suppressWarnings(as.numeric(eigenvector))
+    ) %>%
+    filter(!is.na(Domain), !is.na(Year), !is.na(Group))
+
+  # ------- aggregate (mean per year x group x domain) -------
+  agg <- long %>%
+    group_by(Domain, Year, Group) %>%
+    summarise(mean_evc = mean(eigenvector, na.rm = TRUE), .groups = "drop")
+
+  # ------- plot -------
+  if (nrow(agg) > 0) {
+    p_eigen <- ggplot(agg, aes(x = Year, y = mean_evc, color = Group, group = Group)) +
+      geom_line(linewidth = 1) +
+      geom_point(size = 2) +
+      facet_wrap(~ Domain, scales = "free_y") +
+      labs(
+        title = "Eigenvector Centrality (Mean) — Treated vs Control",
+        x = "Year",
+        y = "Mean eigenvector centrality",
+        color = "Group"
+      ) +
+      theme_minimal()
+    print(p_eigen)
+  } else {
+    message("No rows to plot for eigenvector centrality after aggregation.")
+  }
+} else {
+  message("No eigenvector centrality columns found matching '_eigenvector_centrality_20'.")
+}
+
+# =========================
+# ---- reshape ALL centralities once ----
+# =========================
+# Picks columns like Hydrogen_degree_centrality_2020, Battery_closeness_centrality_2024, etc.
+pattern_full <- "^(Hydrogen|Battery)_(degree|closeness|betweenness|eigenvector)_centrality_20\\d{2}$"
+
+centrality_cols <- grep(pattern_full, names(df), value = TRUE, ignore.case = TRUE)
+
+if (length(centrality_cols) == 0) {
+  message("No centrality columns found matching the full pattern: ", pattern_full)
+} else {
+  long_all <- df %>%
+    select(Group, all_of(centrality_cols)) %>%
+    pivot_longer(
+      cols = -Group,
+      names_to   = c("Domain", "Metric", "Year"),
+      names_pattern = "^(Hydrogen|Battery)_(degree|closeness|betweenness|eigenvector)_centrality_(20\\d{2})$",
+      values_to  = "value"
+    ) %>%
+    mutate(
+      Year   = suppressWarnings(as.integer(Year)),
+      Metric = tolower(Metric),
+      value  = suppressWarnings(as.numeric(value))
+    ) %>%
+    filter(!is.na(Group), !is.na(Year))
+
+  # ---- plotting helper ----
+  plot_centrality <- function(which_metric = c("degree","closeness","betweenness","eigenvector"),
+                              save = FALSE, out_folder = folder) {
+    which_metric <- match.arg(which_metric)
+    agg <- long_all %>%
+      filter(Metric == which_metric) %>%
+      group_by(Domain, Year, Group) %>%
+      summarise(mean_val = mean(value, na.rm = TRUE), .groups = "drop")
+
+    if (nrow(agg) == 0) {
+      message("No data for metric: ", which_metric)
+      return(invisible(NULL))
+    }
+
+    p <- ggplot(agg, aes(x = Year, y = mean_val, color = Group, group = Group)) +
+      geom_line(linewidth = 1) +
+      geom_point(size = 2) +
+      facet_wrap(~ Domain, scales = "free_y") +
+      labs(
+        title = paste0(str_to_title(which_metric), " Centrality (Mean) — Treated vs Control"),
+        x = "Year",
+        y = paste0("Mean ", which_metric, " centrality"),
+        color = "Group"
+      ) +
+      theme_minimal()
+
+    if (isTRUE(save)) {
+      ggsave(file.path(out_folder, paste0(which_metric, "_centrality_trends_by_group.png")),
+             p, width = 9, height = 5, dpi = 300)
+    }
+    return(p)
+  }
+
+  # ---- examples: call the visuals you need ----
+  p_deg  <- plot_centrality("degree")
+  p_clo  <- plot_centrality("closeness")
+  p_bet  <- plot_centrality("betweenness")
+  p_eig  <- plot_centrality("eigenvector")
+
+  # Show individually (only if they exist)
+  if (!is.null(p_deg)) print(p_deg)
+  if (!is.null(p_clo)) print(p_clo)
+  if (!is.null(p_bet)) print(p_bet)
+  if (!is.null(p_eig)) print(p_eig)
+
+  # Combine with patchwork if all exist
+  if (!is.null(p_deg) && !is.null(p_clo) && !is.null(p_bet) && !is.null(p_eig)) {
+    p_all <- (p_deg | p_clo) / (p_bet | p_eig)
+    print(p_all)
+    ggsave(
+      filename = file.path(folder, "centrality_trends_all.png"),
+      plot = p_all,
+      width = 14,
+      height = 10,
+      dpi = 300
+    )
+  } else {
+    message("Combined plot not saved because one or more individual plots were missing.")
+  }
+}
