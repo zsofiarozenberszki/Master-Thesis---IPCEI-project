@@ -148,8 +148,48 @@ readr::write_delim(final_nodup %>% remove_empty("cols"), out_nodup, delim = ";",
 message("Saved as semicolon-delimited CSVs with dot decimal mark and NA for missing values:\n - ", out_exact_fuzzy, "\n - ", out_nodup)
 
 
+############################ filling NA values in centralities with 0.0 ###################
+#######################################################################################
+
+library(readr)
+library(dplyr)
+library(tidyr)
+library(stringr)
+
+# ---- paths ----
+folder   <- "C:/Users/zsofi/OneDrive - TUM/Desktop/TUM/01_Master Thesis/ICPEI data/z_Eigenvector_centrality_files"
+in_path  <- file.path(folder, "SELECTED_Matched_Merged_final.csv")
+out_path <- file.path(folder, "SELECTED_Matched_Merged_final_centralities_filled.csv")
+
+# ---- load as semicolon-delimited ----
+df <- read_delim(in_path, delim = ";", show_col_types = FALSE)
+names(df) <- trimws(names(df))
+
+# ---- detect ONLY centrality columns ----
+centrality_cols <- grep("^(Hydrogen|Battery)_(degree|closeness|betweenness|eigenvector)_centrality_20\\d{2}$",
+                        names(df), value = TRUE, ignore.case = TRUE)
+
+# ---- coerce to numeric (replace commas with dots), then fill NAs with 0.0 ----
+df <- df %>%
+  mutate(across(
+    all_of(centrality_cols),
+    ~ {
+      x <- as.character(.)
+      x <- ifelse(is.na(x), NA_character_, gsub(",", ".", x, fixed = TRUE))
+      x <- as.numeric(x)
+      replace_na(x, 0.0)
+    }
+  ))
+
+# ---- save as semicolon-separated, NA preserved everywhere else ----
+write_delim(df, out_path, delim = ";", na = "NA")
+
+cat("Saved cleaned file to:\n", out_path, "\n")
+
+##############################################################################
+######## visualisations ######################################################
+
 # ------- libraries -------
-# install.packages(c("readr","dplyr","tidyr","ggplot2","stringr","patchwork"))
 library(readr)
 library(dplyr)
 library(tidyr)
@@ -160,7 +200,7 @@ library(patchwork)
 # ------- paths -------
 folder  <- "C:/Users/zsofi/OneDrive - TUM/Desktop/TUM/01_Master Thesis/ICPEI data/z_Eigenvector_centrality_files"
 # ensure you have the correct filename + extension here:
-in_path <- file.path(folder, "SELECTED_Matched_Merged_final.csv")
+in_path <- file.path(folder, "SELECTED_Matched_Merged_final_centralities_filled.csv")
 
 # ------- load (semicolon-delimited) -------
 # If you saved with dot decimals (.), default readr is fine.
