@@ -1,0 +1,161 @@
+# ---- Libraries ----
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(readr)
+  library(stringr)
+})
+
+# ---- Paths ----
+base_dir   <- "C:/Users/zsofi/OneDrive - TUM/Desktop/TUM/01_Master Thesis/ICPEI data/Control group"
+ipcei_file <- file.path(base_dir, "IPCEI_Companies_standardised.csv")
+
+# ---- Reader: ; delimiter, . decimal, clean headers ----
+read_semicolon <- function(path) {
+  df <- read_delim(
+    file   = path,
+    delim  = ";",
+    locale = locale(decimal_mark = ".", grouping_mark = ","),
+    escape_double = TRUE,
+    show_col_types = FALSE,
+    guess_max = 10000,
+    progress = FALSE
+  )
+  names(df) <- names(df) |>
+    str_replace_all("\u00A0", " ") |>
+    str_replace_all("[\t\r\n]+", " ") |>
+    str_replace_all("\\s+", " ") |>
+    str_trim()
+  df
+}
+
+# ---- List country files (control universe) ----
+country_files <- list.files(
+  path = base_dir,
+  pattern = "_merged_standardised\\.csv$",
+  recursive = TRUE, full.names = TRUE
+)
+country_files <- country_files[normalizePath(country_files) != normalizePath(ipcei_file)]
+if (!length(country_files)) stop("No *_merged_standardised.csv files found under: ", base_dir)
+
+# ---- Extract country (optional) ----
+extract_country <- function(fp) {
+  nm <- tools::file_path_sans_ext(basename(fp))
+  sub("_merged_standardised$", "", nm)
+}
+
+# ---- Read data ----
+control_raw <- purrr::map_dfr(country_files, function(fp) {
+  df <- read_semicolon(fp)
+  df$country_file <- extract_country(fp)
+  df
+})
+ipcei_raw <- read_semicolon(ipcei_file)
+
+# ---- EXACT non-standardised columns (2018–2023) ----
+years <- 2018:2023
+turnover_cols <- paste0("Operating revenue (Turnover) th EUR ", years)
+roa_cols      <- paste0("ROA using Profit (Loss) before tax ", years)
+needed_cols   <- c(turnover_cols, roa_cols)
+
+# ---- Forgiving numeric parser ----
+parse_numeric <- function(x) {
+  if (is.numeric(x)) return(as.numeric(x))
+  x_chr <- as.character(x)
+  # normalize whitespace and NBSP
+  x_chr <- str_replace_all(x_chr, "\u00A0", " ")
+  x_chr <- str_squish(x_chr)
+  # explicit missing markers
+  x_chr <- ifelse(x_chr %in% c("-", "—", "NA", "N/A", ""), NA_character_, x_chr)
+  # remove thousands separators (commas)
+  x_chr <- str_replace_all(x_chr, ",", "")
+  # final parse
+  suppressWarnings(as.numeric(x_chr))
+}
+
+# ---- Pivot helper (soft: continue if some cols missing) ----
+pivot_to_long_nonstd <- function(df, group_label) {
+  available <- intersect(needed_cols, names(df))
+  missing   <- setdiff(needed_cols, names(df))
+
+  message("\n[", group_label, "] Found ", length(available), " / ", length(needed_cols), " expected columns.")
+  if (length(available)) message("Available (up to 12): ", paste(head(available, 12), collapse = " | "))
+  if (length(missing))   message("Missing (up to 12): ", paste(head(missing, 12), collapse = " | "))
+
+  if (!length(available)) {
+    return(tibble(metric = character(), year = integer(), value = numeric(), group = character()))
+  }
+
+  df %>%
+    select(any_of(available)) %>%
+    mutate(.row_id = row_number()) %>%
+    pivot_longer(cols = - .row_id, names_to = "metric_year", values_to = "value_raw") %>%
+    mutate(
+      metric = case_when(
+        str_starts(metric_year, "Operating revenue (Turnover) th EUR") ~ "Turnover",
+        str_starts(metric_year, "ROA using Profit (Loss) before tax")   ~ "ROA",
+        TRUE ~ NA_character_
+      ),
+      year  = readr::parse_integer(str_extract(metric_year, "20\\d{2}")),
+      # force to character first to avoid any list-cols or factors
+      value = parse_numeric(as.character(value_raw)),
+      group = group_label
+    ) %>%
+    filter(!is.na(metric), !is.na(year)) %>%
+    select(metric, year, value, group)
+}
+
+control_long <- pivot_to_long_nonstd(control_raw, "Control")
+ipcei_long   <- pivot_to_long_nonstd(ipcei_raw, "IPCEI")
+
+# ---- Combine & summarise ----
+long_all <- bind_rows(control_long, ipcei_long)
+
+# Diagnostics before dropping NAs: how many rows, how many non-missing per block
+message("\nRows before dropping NA: ", nrow(long_all))
+diag_counts <- long_all %>%
+  mutate(is_non_na = !is.na(value)) %>%
+  group_by(group, metric, year) %>%
+  summarise(non_missing = sum(is_non_na), total = n(), .groups = "drop") %>%
+  arrange(metric, year, group)
+message("Non-missing/total by group-metric-year (first 24 rows):")
+print(head(diag_counts, 24))
+
+# If everything is missing, stop with a clear hint
+if (all(is.na(long_all$value))) {
+  stop("All parsed values are NA. If you see '-' as a placeholder in your CSVs, the parser now treats it as missing.")
+}
+
+trend_df <- long_all %>%
+  filter(!is.na(value)) %>%
+  group_by(group, metric, year) %>%
+  summarise(avg = mean(value), n = n(), .groups = "drop") %>%
+  arrange(metric, year, group)
+
+print(trend_df)
+
+# ---- Plot helpers ----
+plot_metric <- function(metric_name, df = trend_df, ylab = "Average") {
+  dat <- df %>% filter(metric == metric_name, !is.na(avg))
+  if (!nrow(dat)) {
+    message("No data to plot for metric: ", metric_name)
+    return(ggplot() + labs(title = paste("No data for", metric_name)))
+  }
+  ggplot(dat, aes(x = year, y = avg, group = group, linetype = group)) +
+    geom_line(linewidth = 1) +
+    geom_point(size = 2) +
+    scale_x_continuous(breaks = years) +
+    labs(
+      title    = paste0("Average ", metric_name, " by Year (non-standardised)"),
+      subtitle = "IPCEI firms vs Control universe",
+      x        = "Year",
+      y        = ylab,
+      linetype = "Group"
+    ) +
+    theme_minimal(base_size = 12)
+}
+
+p_roa      <- plot_metric("ROA", ylab = "Average ROA")
+p_turnover <- plot_metric("Turnover", ylab = "Average Turnover (th EUR)")
+
+print(p_roa)
+print(p_turnover)
